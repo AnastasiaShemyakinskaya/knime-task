@@ -3,49 +3,70 @@ package lib
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
 
-type Publisher interface {
-	Publish(context.Context, *Message) error
-	Run()
-	Shutdown()
+// Database interface for db used in Publisher
+type Database interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+// MQ interface for message queue used in Publisher
+type MQ interface {
+	Publish(topic string, data []byte) error
+}
+
+// lockNum is the advisory lock ID used for leader election via PostgreSQL.
+const lockNum = 42
+
+// Publisher defines the interface for publishing messages.
+type Publisher interface {
+	Publish(context.Context, *Message) error
+	Run(context.Context)
+}
+
+// publisher implements the Publisher interface.
+// It sends messages from PostgreSQL to a MQ server.
 type publisher struct {
-	pool   *pgxpool.Pool
-	nats   *nats.Conn
-	cancel context.CancelFunc
+	db     Database
+	nats   MQ
 	logger *zap.Logger
 }
 
-func NewPublisher(nats *nats.Conn, pool *pgxpool.Pool, logger *zap.Logger) Publisher {
+// NewPublisher constructs a new publisher instance.
+// If no logger is provided, it uses a no-op logger.
+func NewPublisher(nats MQ, db Database, logger *zap.Logger) Publisher {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &publisher{nats: nats, pool: pool, logger: logger}
+	return &publisher{nats: nats, db: db, logger: logger}
 }
 
-func (p *publisher) Run() {
-	ctx, cancel := context.WithCancel(context.Background())
-	p.cancel = cancel
-	go p.startConsume(ctx)
-}
-
-func (p *publisher) Shutdown() {
-	if p.cancel != nil {
-		p.cancel()
+// Run tries to acquire leadership and starts the publishing loop.
+func (p *publisher) Run(ctx context.Context) {
+	leader, err := tryAcquireLeadership(ctx, p.db, lockNum)
+	if err != nil {
+		p.logger.Error("failed to acquire leadership", zap.Error(err))
+		return
 	}
+
+	if !leader {
+		p.logger.Info("this instance is not the leader, skipping consuming")
+		return
+	}
+
+	p.logger.Info("this instance became the leader, starting consuming")
+	go p.startPublish(ctx)
 }
 
+// Publish stores a message into the database for later publishing to MQ.
 func (p *publisher) Publish(ctx context.Context, message *Message) error {
-	tx, err := p.pool.Begin(ctx)
+	tx, err := p.db.Begin(ctx)
 	if err != nil {
 		return err
 	}
@@ -55,11 +76,11 @@ func (p *publisher) Publish(ctx context.Context, message *Message) error {
 		}
 		err = tx.Rollback(ctx)
 		if err != nil {
-			log.Printf("Rollback failed: %v", err)
+			p.logger.Error("rollback failed", zap.Error(err))
 		}
 	}(tx, ctx)
 
-	_, err = tx.Exec(ctx, "INSERT INTO outbox (id, message, message_type, topic) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", message.Id, message.Message, message.MessageType, message.Topic)
+	_, err = tx.Exec(ctx, "INSERT INTO messages (message_id, message, message_type, topic) VALUES ($1, $2, $3, $4) ON CONFLICT (message_id) DO NOTHING", message.Id, message.Message, message.MessageType, message.Topic)
 	if err != nil {
 		return err
 	}
@@ -70,24 +91,27 @@ func (p *publisher) Publish(ctx context.Context, message *Message) error {
 	return nil
 }
 
-func (p *publisher) startConsume(ctx context.Context) {
-	ticker := time.NewTicker(time.Millisecond * 100)
+// startPublish periodically sends pending messages to MQ.
+func (p *publisher) startPublish(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("consumer stopped")
+			p.logger.Warn("consumer stopped")
 			return
 		case <-ticker.C:
 			err := p.sendMessages(ctx)
 			if err != nil {
-				log.Printf("failed to send messages: %v", err)
+				p.logger.Error("failed to send messages", zap.Error(err))
 			}
 		}
 	}
 }
 
+// sendMessages gets unsent messages from the database and publishes them to MQ.
 func (p *publisher) sendMessages(ctx context.Context) error {
-	rows, err := p.pool.Query(ctx, "SELECT id, message, message_type FROM outbox WHERE processed_at IS NULL LIMIT 100")
+	rows, err := p.db.Query(ctx, "SELECT id, message, message_type, topic FROM messages WHERE processed_at IS NULL LIMIT 100")
 	if err != nil {
 		return err
 	}
@@ -96,30 +120,34 @@ func (p *publisher) sendMessages(ctx context.Context) error {
 	var processed []string
 	for rows.Next() {
 		var msg Message
-		if err = rows.Scan(&msg.Id, &msg.Message, &msg.MessageType); err != nil {
-			log.Printf("scan failed: %v", err)
+		if err = rows.Scan(&msg.Id, &msg.Message, &msg.MessageType, &msg.Topic); err != nil {
+			p.logger.Error("scan failed", zap.Error(err))
 			continue
 		}
 
 		payload, err := json.Marshal(msg)
 		if err != nil {
-			log.Printf("marshal failed: %v", err)
+			p.logger.Error("marshal failed", zap.Error(err))
 			continue
 		}
 
 		if err = p.nats.Publish(msg.Topic, payload); err != nil {
-			log.Printf("publish failed: %v", err)
+			p.logger.Error("publish failed", zap.Error(err))
 			continue
 		}
 
 		processed = append(processed, msg.Id)
 	}
 
+	if len(processed) == 0 {
+		return nil
+	}
 	return p.markMessageAsProcessed(ctx, processed)
 }
 
+// markMessageAsProcessed updates the database and mark messages as processed.
 func (p *publisher) markMessageAsProcessed(ctx context.Context, id []string) error {
-	tx, err := p.pool.Begin(ctx)
+	tx, err := p.db.Begin(ctx)
 	if err != nil {
 		return err
 	}
@@ -129,9 +157,16 @@ func (p *publisher) markMessageAsProcessed(ctx context.Context, id []string) err
 		}
 	}()
 
-	_, err = tx.Exec(ctx, "UPDATE outbox SET processed_at = NOW() WHERE id = ANY(?)", id)
+	_, err = tx.Exec(ctx, "UPDATE messages SET processed_at = NOW() WHERE id = ANY($1)", id)
 	if err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// tryAcquireLeadership attempts to acquire a PostgreSQL advisory lock. Only one instance can hold the lock
+func tryAcquireLeadership(ctx context.Context, pool Database, lockID int64) (bool, error) {
+	var success bool
+	err := pool.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockID).Scan(&success)
+	return success, err
 }
